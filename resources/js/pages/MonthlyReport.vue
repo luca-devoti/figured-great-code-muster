@@ -1,7 +1,20 @@
 <script setup>
 import axios from 'axios';
-import { computed, onMounted, ref, watch } from 'vue';
+import { Chart, registerables } from 'chart.js';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { money, monthName } from '../format';
+
+Chart.register(...registerables);
+
+// Brand colours, matched to the CSS custom properties in resources/css/app.css
+// so the chart reads as part of the same app, not a bolted-on library default.
+const CHART_COLORS = {
+    budget: '#cfd8dc', // --color-fg-muted-grey
+    favourable: '#13c366', // --color-fg-positive
+    unfavourable: '#f7ba2a', // --color-fg-warning
+    grid: '#eceff1', // --color-fg-pale-grey
+    text: '#607d8b', // --color-fg-mid-grey
+};
 
 const farms = ref([]);
 const selectedFarmId = ref(null);
@@ -22,6 +35,20 @@ const generateError = ref('');
 
 // This month vs season-to-date view.
 const viewMode = ref('month');
+
+// Season trend chart: which category is plotted. Stays on auto-pick (the category that has
+// moved furthest from budget) as the adviser changes month, so the chart keeps surfacing
+// whatever's most worth a second look - until the adviser picks a category themselves, at
+// which point their choice sticks until they switch farms.
+const chartCategory = ref(null);
+const chartCategoryTouched = ref(false);
+const chartCanvas = ref(null);
+let chartInstance = null;
+
+function selectChartCategory(category) {
+    chartCategoryTouched.value = true;
+    chartCategory.value = category;
+}
 
 onMounted(async () => {
     const { data } = await axios.get('/api/farms');
@@ -130,6 +157,112 @@ const seasonWeatherHighlights = computed(() => {
 // instead of clicking through all 12 months per farm to find out what's left.
 const monthsWithCommentary = computed(() => new Set(commentaries.value.map((c) => c.month)));
 
+// Budgeted vs actual profit for whatever period is on screen (this month, or season to
+// date) - the single number a farmer actually wants to know, ahead of the category detail.
+const periodProfit = computed(() => {
+    let budget = 0;
+    let actual = 0;
+    for (const line of displayLines.value) {
+        const sign = isIncomeCategory(line.category) ? 1 : -1;
+        budget += sign * line.budget;
+        actual += sign * line.actual;
+    }
+    return { budget, actual, difference: actual - budget };
+});
+
+// Pick the category worth charting by default: whichever has moved furthest from budget
+// for the season shown, so the trend chart opens already pointed at the thing worth
+// discussing (e.g. Wheat Income for Windrow Cropping after a delayed harvest) instead of an
+// alphabetically-first category nobody asked about. Re-picks as the adviser moves through
+// months (a shortfall that gets resolved should stop being the headline), but leaves the
+// adviser's own choice alone once they've made one.
+watch(selectedFarmId, () => {
+    chartCategoryTouched.value = false;
+});
+
+watch(seasonLines, (current) => {
+    if (!current.length) {
+        chartCategory.value = null;
+        return;
+    }
+    if (chartCategoryTouched.value && current.some((l) => l.category === chartCategory.value)) return;
+    chartCategory.value = [...current].sort((a, b) => Math.abs(b.actual - b.budget) - Math.abs(a.actual - a.budget))[0].category;
+});
+
+// The charted category's budget vs actual for every month of the season so far.
+const chartMonthData = computed(() => {
+    if (!chartCategory.value) return [];
+    return seasonMonthsToDate.value.map((month) => {
+        const line = lines.value.find((l) => l.month === month && l.category === chartCategory.value);
+        return { month, budget: line?.budget ?? 0, actual: line?.actual ?? 0 };
+    });
+});
+
+function renderChart() {
+    if (!chartCanvas.value) return;
+    if (chartInstance) {
+        chartInstance.destroy();
+        chartInstance = null;
+    }
+    if (!chartMonthData.value.length) return;
+
+    const isIncome = isIncomeCategory(chartCategory.value);
+    const actualColors = chartMonthData.value.map((d) => {
+        if (!d.budget) return CHART_COLORS.text;
+        const favourable = isIncome ? d.actual >= d.budget : d.actual <= d.budget;
+        return favourable ? CHART_COLORS.favourable : CHART_COLORS.unfavourable;
+    });
+
+    chartInstance = new Chart(chartCanvas.value, {
+        type: 'bar',
+        data: {
+            labels: chartMonthData.value.map((d) => monthName(d.month)),
+            datasets: [
+                {
+                    label: 'Budget',
+                    data: chartMonthData.value.map((d) => d.budget),
+                    backgroundColor: CHART_COLORS.budget,
+                    borderRadius: 3,
+                },
+                {
+                    label: 'Actual',
+                    data: chartMonthData.value.map((d) => d.actual),
+                    backgroundColor: actualColors,
+                    borderRadius: 3,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+                tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${money(ctx.raw)}` } },
+            },
+            scales: {
+                x: { grid: { display: false }, ticks: { color: CHART_COLORS.text, font: { size: 11 } } },
+                y: {
+                    grid: { color: CHART_COLORS.grid },
+                    ticks: {
+                        color: CHART_COLORS.text,
+                        font: { size: 11 },
+                        callback: (v) => (Math.abs(v) >= 1000 ? `${v / 1000}k` : v),
+                    },
+                },
+            },
+        },
+    });
+}
+
+watch(chartMonthData, async () => {
+    await nextTick();
+    renderChart();
+});
+
+onBeforeUnmount(() => {
+    if (chartInstance) chartInstance.destroy();
+});
+
 async function saveCommentary() {
     saving.value = true;
     const { data } = await axios.put(`/api/farms/${selectedFarmId.value}/commentary`, {
@@ -237,6 +370,27 @@ Write the monthly commentary for this farm and month.`;
 
         <div v-else class="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <div class="lg:col-span-2">
+                <!-- The one number a farmer actually wants: did we make more or less than planned. -->
+                <div class="mb-3 grid grid-cols-3 gap-2 text-center">
+                    <div class="rounded border border-fg-muted-grey bg-white p-2.5">
+                        <p class="text-xs text-fg-light-grey">Budgeted profit</p>
+                        <p class="text-base font-semibold">{{ money(periodProfit.budget) }}</p>
+                    </div>
+                    <div class="rounded border border-fg-muted-grey bg-white p-2.5">
+                        <p class="text-xs text-fg-light-grey">Actual profit</p>
+                        <p class="text-base font-semibold">{{ money(periodProfit.actual) }}</p>
+                    </div>
+                    <div class="rounded p-2.5" :class="periodProfit.difference >= 0 ? 'bg-fg-positive-9' : 'bg-fg-danger-9'">
+                        <p class="text-xs text-fg-light-grey">Difference</p>
+                        <p
+                            class="text-base font-semibold"
+                            :class="periodProfit.difference >= 0 ? 'text-fg-positive-dark' : 'text-fg-danger-dark'"
+                        >
+                            {{ periodProfit.difference >= 0 ? '+' : '' }}{{ money(periodProfit.difference) }}
+                        </p>
+                    </div>
+                </div>
+
                 <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
                     <div class="inline-flex overflow-hidden rounded border border-fg-muted-grey text-xs">
                         <button
@@ -286,6 +440,30 @@ Write the monthly commentary for this farm and month.`;
                             </tr>
                         </tbody>
                     </table>
+                </div>
+
+                <!-- The season story for one category, visually - the table above answers "what",
+                     this answers "is it actually a problem once the rest of the season is in". -->
+                <div class="mt-4 rounded border border-fg-muted-grey bg-white p-4">
+                    <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <h3 class="text-sm font-semibold">Season trend</h3>
+                        <select
+                            :value="chartCategory"
+                            class="rounded border border-fg-muted-grey bg-white px-2 py-1 text-xs"
+                            @change="selectChartCategory($event.target.value)"
+                        >
+                            <option v-for="line in seasonLines" :key="line.category" :value="line.category">
+                                {{ line.category }}
+                            </option>
+                        </select>
+                    </div>
+                    <p class="mb-2 text-xs text-fg-light-grey">
+                        Budget vs actual, {{ monthName(seasonMonthsToDate[0]) }} – {{ monthName(selectedMonth) }}. Bars are
+                        coloured green where {{ chartCategory }} helped the result and orange where it hurt it.
+                    </p>
+                    <div class="h-56">
+                        <canvas ref="chartCanvas"></canvas>
+                    </div>
                 </div>
             </div>
 

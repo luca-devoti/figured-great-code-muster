@@ -15,6 +15,11 @@ const saving = ref(false);
 const savedAt = ref(null);
 const loading = ref(true);
 
+// AI commentary draft generation.
+const aiInstructions = ref('');
+const generating = ref(false);
+const generateError = ref('');
+
 onMounted(async () => {
     const { data } = await axios.get('/api/farms');
     farms.value = data;
@@ -71,6 +76,47 @@ async function saveCommentary() {
     else commentaries.value.push(data);
     saving.value = false;
     savedAt.value = new Date();
+}
+
+async function generateCommentary() {
+    const farm = farms.value.find((f) => f.id === selectedFarmId.value);
+
+    const reportBlock = monthLines.value
+        .map((l) => `- ${l.category}: budget ${money(l.budget)}, actual ${money(l.actual)}, variance ${money(variance(l))}`)
+        .join('\n');
+
+    const weatherBlock = monthWeather.value
+        ? `Rainfall: ${monthWeather.value.rainfall_mm}mm (${monthWeather.value.rainfall_pct_normal}% of normal)
+Mean temperature: ${monthWeather.value.mean_temp_c}°C
+Soil moisture deficit: ${monthWeather.value.soil_moisture_deficit_mm}mm
+Notes: ${monthWeather.value.notes}`
+        : 'No weather data available for this month.';
+
+    const prompt = `Farm: ${farm.name} (${farm.type}), owner ${farm.owner_name}
+Month: ${monthName(selectedMonth.value)}
+
+Budget vs actual for this month:
+${reportBlock}
+
+Regional weather conditions this month:
+${weatherBlock}
+${aiInstructions.value.trim() ? `\nThe adviser wants this commentary to focus on: ${aiInstructions.value.trim()}` : ''}
+
+Write the monthly commentary for this farm and month.`;
+
+    generating.value = true;
+    generateError.value = '';
+    try {
+        const { data } = await axios.post('/api/ai', {
+            system: "You are a rural accounting adviser at Southdown Rural Accountants (Waikato, NZ) writing monthly commentary for a farm client. Write 2-4 short paragraphs in plain English: summarise what happened financially this month, call out notable budget variances and a plausible reason for them (referencing weather where relevant), and flag anything worth following up with the farmer. Only use the figures given to you - never invent numbers. Do not use markdown formatting.",
+            prompt,
+        });
+        commentaryDraft.value = data.text.trim();
+    } catch (e) {
+        generateError.value = e.response?.data?.error ?? e.message;
+    } finally {
+        generating.value = false;
+    }
 }
 </script>
 
@@ -134,6 +180,25 @@ async function saveCommentary() {
                 <p class="mb-2 text-xs text-fg-light-grey">
                     What happened this month, and does anything need following up with the farmer?
                 </p>
+
+                <div class="mb-2 flex gap-2">
+                    <input
+                        v-model="aiInstructions"
+                        type="text"
+                        placeholder="Optional: what should this focus on? (e.g. mention the storm losses)"
+                        class="flex-1 rounded border border-fg-muted-grey px-2 py-1.5 text-sm"
+                        @keyup.enter="generateCommentary"
+                    />
+                    <button
+                        class="shrink-0 rounded border border-fg-main-blue px-3 py-1.5 text-sm font-medium text-fg-main-blue hover:bg-fg-main-blue-9 disabled:opacity-50"
+                        :disabled="generating || !monthLines.length"
+                        @click="generateCommentary"
+                    >
+                        {{ generating ? 'Generating…' : '✨ Generate with AI' }}
+                    </button>
+                </div>
+                <p v-if="generateError" class="mb-2 rounded bg-fg-danger-9 p-2 text-xs text-fg-danger-dark">{{ generateError }}</p>
+
                 <textarea
                     v-model="commentaryDraft"
                     rows="12"

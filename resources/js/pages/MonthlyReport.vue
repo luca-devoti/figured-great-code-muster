@@ -32,6 +32,16 @@ const loading = ref(true);
 const aiInstructions = ref('');
 const generating = ref(false);
 const generateError = ref('');
+// True whenever the textarea holds an AI draft the adviser hasn't reviewed yet (by
+// editing it or saving it) - so an unread AI paragraph can never look identical to the
+// adviser's own reviewed words before it's copied into a client email.
+const aiDraftUnreviewed = ref(false);
+
+// Open items elsewhere in the practice for the selected farm (unanswered emails,
+// invoices not yet keyed in) - so the adviser can see there's an unresolved question or
+// disputed invoice before finalising a report that numbers depend on it.
+const emails = ref([]);
+const invoices = ref([]);
 
 // This month vs season-to-date view.
 const viewMode = ref('month');
@@ -54,6 +64,12 @@ onMounted(async () => {
     const { data } = await axios.get('/api/farms');
     farms.value = data;
     selectedFarmId.value = data[0]?.id ?? null;
+
+    // Fetched once - these lists are small and don't depend on the selected farm,
+    // just which of their rows get matched to it below.
+    const [emailsRes, invoicesRes] = await Promise.all([axios.get('/api/emails'), axios.get('/api/invoices')]);
+    emails.value = emailsRes.data;
+    invoices.value = invoicesRes.data.invoices;
 });
 
 watch(selectedFarmId, loadReport);
@@ -79,6 +95,14 @@ function loadCommentaryDraft() {
     const existing = commentaries.value.find((c) => c.month === selectedMonth.value);
     commentaryDraft.value = existing?.body ?? '';
     savedAt.value = null;
+    aiDraftUnreviewed.value = false;
+}
+
+// Any deliberate action on the draft - editing it or saving it - counts as the adviser
+// having read it, so the "unreviewed" flag only ever covers the moment right after
+// generation.
+function touchCommentaryDraft() {
+    aiDraftUnreviewed.value = false;
 }
 
 const monthLines = computed(() => lines.value.filter((l) => l.month === selectedMonth.value));
@@ -156,6 +180,23 @@ const seasonWeatherHighlights = computed(() => {
 // Which months already have commentary, so the adviser can see the backlog at a glance
 // instead of clicking through all 12 months per farm to find out what's left.
 const monthsWithCommentary = computed(() => new Set(commentaries.value.map((c) => c.month)));
+
+// Unanswered emails from the farmer, and invoices not yet keyed in, matched to the
+// selected farm. Neither table stores a farm_id - emails are matched by sender name
+// against the farm's owner (an email from someone else, e.g. a supplier, is a
+// practice-wide concern rather than this farm's, so it's deliberately left out here),
+// invoices by the account name printed on the scanned text.
+const openEmailsForFarm = computed(() => {
+    const farm = farms.value.find((f) => f.id === selectedFarmId.value);
+    if (!farm) return [];
+    return emails.value.filter((e) => e.from_name === farm.owner_name && !e.replied_at);
+});
+
+const openInvoicesForFarm = computed(() => {
+    const farm = farms.value.find((f) => f.id === selectedFarmId.value);
+    if (!farm) return [];
+    return invoices.value.filter((i) => i.raw_text.toUpperCase().includes(farm.name.toUpperCase()) && !i.entered_at);
+});
 
 // Budgeted vs actual profit for whatever period is on screen (this month, or season to
 // date) - the single number a farmer actually wants to know, ahead of the category detail.
@@ -275,6 +316,7 @@ async function saveCommentary() {
     else commentaries.value.push(data);
     saving.value = false;
     savedAt.value = new Date();
+    aiDraftUnreviewed.value = false;
 }
 
 async function generateCommentary() {
@@ -322,6 +364,7 @@ Write the monthly commentary for this farm and month.`;
             prompt,
         });
         commentaryDraft.value = data.text.trim();
+        aiDraftUnreviewed.value = true;
     } catch (e) {
         generateError.value = e.response?.data?.error ?? e.message;
     } finally {
@@ -368,7 +411,27 @@ Write the monthly commentary for this farm and month.`;
 
         <p v-if="loading" class="text-fg-light-grey">Loading…</p>
 
-        <div v-else class="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <!-- Unresolved items elsewhere in the practice for this farm - a report is only as
+             good as the numbers behind it, and those numbers can still be in dispute on
+             another screen. -->
+        <div
+            v-if="!loading && (openEmailsForFarm.length || openInvoicesForFarm.length)"
+            class="mb-4 rounded border border-fg-warning-15 bg-fg-warning-15 p-3"
+        >
+            <p class="text-sm font-medium text-fg-warning-text">
+                ⚠ Open items for this client — review before finalising this report
+            </p>
+            <ul class="mt-1 space-y-0.5 text-xs text-fg-dark-grey">
+                <li v-for="e in openEmailsForFarm" :key="`email-${e.id}`">
+                    Unanswered email — "{{ e.subject }}" (Inbox)
+                </li>
+                <li v-for="i in openInvoicesForFarm" :key="`invoice-${i.id}`">
+                    Invoice not yet entered — {{ i.filename }} (Invoice entry)
+                </li>
+            </ul>
+        </div>
+
+        <div v-if="!loading" class="grid grid-cols-1 gap-4 lg:grid-cols-3">
             <div class="lg:col-span-2">
                 <!-- The one number a farmer actually wants: did we make more or less than planned. -->
                 <div class="mb-3 grid grid-cols-3 gap-2 text-center">
@@ -491,12 +554,16 @@ Write the monthly commentary for this farm and month.`;
                     </button>
                 </div>
                 <p v-if="generateError" class="mb-2 rounded bg-fg-danger-9 p-2 text-xs text-fg-danger-dark">{{ generateError }}</p>
+                <p v-if="aiDraftUnreviewed" class="mb-2 rounded bg-fg-warning-15 p-2 text-xs font-medium text-fg-warning-text">
+                    ✨ AI draft — read it over before saving or sharing with the farmer
+                </p>
 
                 <textarea
                     v-model="commentaryDraft"
                     rows="12"
                     class="w-full rounded border border-fg-muted-grey p-2 text-sm"
                     placeholder="Write the month's commentary…"
+                    @input="touchCommentaryDraft"
                 ></textarea>
                 <div class="mt-2 flex items-center gap-3">
                     <button

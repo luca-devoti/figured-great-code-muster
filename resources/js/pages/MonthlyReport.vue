@@ -20,6 +20,9 @@ const aiInstructions = ref('');
 const generating = ref(false);
 const generateError = ref('');
 
+// This month vs season-to-date view.
+const viewMode = ref('month');
+
 onMounted(async () => {
     const { data } = await axios.get('/api/farms');
     farms.value = data;
@@ -64,6 +67,69 @@ function variancePercent(line) {
     return ((line.actual - line.budget) / line.budget) * 100;
 }
 
+// Income/sales categories are favourable when actual > budget; expense categories are the
+// opposite. Flat "over budget = warning" styling would flag good news (e.g. strong lamb
+// sales) the same way as bad news (e.g. a feed bill blowout), which misleads the farmer
+// reading the report.
+function isIncomeCategory(category) {
+    return /income|sales/i.test(category);
+}
+
+function isFavourable(line) {
+    return isIncomeCategory(line.category) ? line.actual >= line.budget : line.actual <= line.budget;
+}
+
+function varianceClass(line) {
+    if (!line.budget || Math.abs(variance(line)) <= line.budget * 0.1) return '';
+    return isFavourable(line) ? 'font-semibold text-fg-positive-dark' : 'font-semibold text-fg-warning-text';
+}
+
+// All months of the season up to and including the selected one, in chronological order.
+const seasonMonthsToDate = computed(() => {
+    const idx = months.value.indexOf(selectedMonth.value);
+    return idx === -1 ? months.value : months.value.slice(0, idx + 1);
+});
+
+// Season-to-date totals per category. Bruce (Windrow Cropping) explicitly asked for this in
+// his emails about the bank meeting — a single bad month (e.g. January's flooded wheat
+// harvest) can look very different once the months that followed are added back in.
+const seasonLines = computed(() => {
+    const inSeason = new Set(seasonMonthsToDate.value);
+    const totals = new Map();
+    for (const line of lines.value) {
+        if (!inSeason.has(line.month)) continue;
+        const running = totals.get(line.category) ?? { category: line.category, budget: 0, actual: 0 };
+        running.budget += line.budget;
+        running.actual += line.actual;
+        totals.set(line.category, running);
+    }
+    return [...totals.values()];
+});
+
+const displayLines = computed(() => (viewMode.value === 'season' ? seasonLines.value : monthLines.value));
+
+const periodLabel = computed(() => {
+    if (viewMode.value !== 'season' || !seasonMonthsToDate.value.length) return '';
+    return `${monthName(seasonMonthsToDate.value[0])} – ${monthName(selectedMonth.value)}`;
+});
+
+// Regional weather worth mentioning in a season narrative (droughts, floods, adverse
+// events) beyond the selected month's own conditions.
+function isNotableWeather(w) {
+    return w.rainfall_pct_normal < 60 || w.rainfall_pct_normal > 150 || w.soil_moisture_deficit_mm > 100;
+}
+
+const seasonWeatherHighlights = computed(() => {
+    const inSeason = new Set(seasonMonthsToDate.value);
+    return weather.value
+        .filter((w) => inSeason.has(w.month) && w.month !== selectedMonth.value && isNotableWeather(w))
+        .map((w) => `${monthName(w.month)}: ${w.notes}`);
+});
+
+// Which months already have commentary, so the adviser can see the backlog at a glance
+// instead of clicking through all 12 months per farm to find out what's left.
+const monthsWithCommentary = computed(() => new Set(commentaries.value.map((c) => c.month)));
+
 async function saveCommentary() {
     saving.value = true;
     const { data } = await axios.put(`/api/farms/${selectedFarmId.value}/commentary`, {
@@ -81,9 +147,13 @@ async function saveCommentary() {
 async function generateCommentary() {
     const farm = farms.value.find((f) => f.id === selectedFarmId.value);
 
-    const reportBlock = monthLines.value
-        .map((l) => `- ${l.category}: budget ${money(l.budget)}, actual ${money(l.actual)}, variance ${money(variance(l))}`)
-        .join('\n');
+    const lineBlock = (lineSet) =>
+        lineSet
+            .map(
+                (l) =>
+                    `- ${l.category} (${isIncomeCategory(l.category) ? 'income' : 'expense'}): budget ${money(l.budget)}, actual ${money(l.actual)}, variance ${money(l.actual - l.budget)}`,
+            )
+            .join('\n');
 
     const weatherBlock = monthWeather.value
         ? `Rainfall: ${monthWeather.value.rainfall_mm}mm (${monthWeather.value.rainfall_pct_normal}% of normal)
@@ -92,14 +162,21 @@ Soil moisture deficit: ${monthWeather.value.soil_moisture_deficit_mm}mm
 Notes: ${monthWeather.value.notes}`
         : 'No weather data available for this month.';
 
+    const highlightsBlock = seasonWeatherHighlights.value.length
+        ? `\n\nOther notable regional weather so far this season:\n${seasonWeatherHighlights.value.join('\n')}`
+        : '';
+
     const prompt = `Farm: ${farm.name} (${farm.type}), owner ${farm.owner_name}
 Month: ${monthName(selectedMonth.value)}
 
-Budget vs actual for this month:
-${reportBlock}
+This month's budget vs actual:
+${lineBlock(monthLines.value)}
+
+Season-to-date (${monthName(seasonMonthsToDate.value[0])} – ${monthName(selectedMonth.value)}):
+${lineBlock(seasonLines.value)}
 
 Regional weather conditions this month:
-${weatherBlock}
+${weatherBlock}${highlightsBlock}
 ${aiInstructions.value.trim() ? `\nThe adviser wants this commentary to focus on: ${aiInstructions.value.trim()}` : ''}
 
 Write the monthly commentary for this farm and month.`;
@@ -108,7 +185,7 @@ Write the monthly commentary for this farm and month.`;
     generateError.value = '';
     try {
         const { data } = await axios.post('/api/ai', {
-            system: "You are a rural accounting adviser at Southdown Rural Accountants (Waikato, NZ) writing monthly commentary for a farm client. Write 2-4 short paragraphs in plain English: summarise what happened financially this month, call out notable budget variances and a plausible reason for them (referencing weather where relevant), and flag anything worth following up with the farmer. Only use the figures given to you - never invent numbers. Do not use markdown formatting.",
+            system: "You are a rural accounting adviser at Southdown Rural Accountants (Waikato, NZ) writing monthly commentary for a farm client. Write 2-4 short paragraphs in plain English: summarise what happened financially this month, call out notable budget variances and a plausible reason for them (referencing weather where relevant), and flag anything worth following up with the farmer. For income/sales categories, actual above budget is favourable; for expense categories, actual above budget is unfavourable - frame variances by what they mean for the farmer, not just their size. Where the season-to-date figures tell a different story than the single month on its own (e.g. a shortfall that was later recovered, or a gain that's still behind for the season), say so explicitly - farmers care about the season trend more than one month in isolation. Only use the figures given to you - never invent numbers. Do not use markdown formatting.",
             prompt,
         });
         commentaryDraft.value = data.text.trim();
@@ -122,11 +199,24 @@ Write the monthly commentary for this farm and month.`;
 
 <template>
     <div>
-        <div class="mb-4">
-            <h2 class="text-lg font-semibold">Monthly report</h2>
-            <p class="text-sm text-fg-mid-grey">
-                Budget vs actual by month. Write commentary for each farm and month — June 2025 for Riverbend is done
-                as an example.
+        <div class="mb-4 flex items-end justify-between">
+            <div>
+                <h2 class="text-lg font-semibold">Monthly report</h2>
+                <p class="text-sm text-fg-mid-grey">
+                    Budget vs actual by month. Write commentary for each farm and month — June 2025 for Riverbend is
+                    done as an example.
+                </p>
+            </div>
+            <p
+                v-if="!loading"
+                class="rounded-full px-2.5 py-1 text-xs font-medium whitespace-nowrap"
+                :class="
+                    monthsWithCommentary.size === months.length
+                        ? 'bg-fg-positive-15 text-fg-positive-dark'
+                        : 'bg-fg-warning-15 text-fg-warning-text'
+                "
+            >
+                {{ monthsWithCommentary.size }} / {{ months.length }} months have commentary
             </p>
         </div>
 
@@ -137,41 +227,66 @@ Write the monthly commentary for this farm and month.`;
                 </option>
             </select>
             <select v-model="selectedMonth" class="rounded border border-fg-muted-grey bg-white px-3 py-1.5 text-sm">
-                <option v-for="month in months" :key="month" :value="month">{{ monthName(month) }}</option>
+                <option v-for="month in months" :key="month" :value="month">
+                    {{ monthsWithCommentary.has(month) ? '✓ ' : '' }}{{ monthName(month) }}
+                </option>
             </select>
         </div>
 
         <p v-if="loading" class="text-fg-light-grey">Loading…</p>
 
         <div v-else class="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <div class="overflow-x-auto rounded border border-fg-muted-grey bg-white lg:col-span-2">
-                <table class="w-full text-sm">
-                    <thead class="bg-fg-super-pale-grey text-left text-fg-mid-grey">
-                        <tr>
-                            <th class="px-3 py-2 font-medium">Category</th>
-                            <th class="px-3 py-2 text-right font-medium">Budget</th>
-                            <th class="px-3 py-2 text-right font-medium">Actual</th>
-                            <th class="px-3 py-2 text-right font-medium">Variance</th>
-                            <th class="px-3 py-2 text-right font-medium">%</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr v-for="line in monthLines" :key="line.id" class="border-t border-fg-pale-grey hover:bg-fg-pale-grey">
-                            <td class="px-3 py-1.5">{{ line.category }}</td>
-                            <td class="px-3 py-1.5 text-right font-mono text-xs">{{ money(line.budget) }}</td>
-                            <td class="px-3 py-1.5 text-right font-mono text-xs">{{ money(line.actual) }}</td>
-                            <td
-                                class="px-3 py-1.5 text-right font-mono text-xs"
-                                :class="Math.abs(variance(line)) > line.budget * 0.1 && line.budget > 0 ? 'font-semibold text-fg-warning-text' : ''"
+            <div class="lg:col-span-2">
+                <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div class="inline-flex overflow-hidden rounded border border-fg-muted-grey text-xs">
+                        <button
+                            class="px-2.5 py-1"
+                            :class="viewMode === 'month' ? 'bg-fg-main-blue text-white' : 'bg-white text-fg-mid-grey hover:bg-fg-pale-grey'"
+                            @click="viewMode = 'month'"
+                        >
+                            This month
+                        </button>
+                        <button
+                            class="border-l border-fg-muted-grey px-2.5 py-1"
+                            :class="viewMode === 'season' ? 'bg-fg-main-blue text-white' : 'bg-white text-fg-mid-grey hover:bg-fg-pale-grey'"
+                            @click="viewMode = 'season'"
+                        >
+                            Season to date
+                        </button>
+                    </div>
+                    <p v-if="periodLabel" class="text-xs text-fg-light-grey">{{ periodLabel }}</p>
+                </div>
+
+                <div class="overflow-x-auto rounded border border-fg-muted-grey bg-white">
+                    <table class="w-full text-sm">
+                        <thead class="bg-fg-super-pale-grey text-left text-fg-mid-grey">
+                            <tr>
+                                <th class="px-3 py-2 font-medium">Category</th>
+                                <th class="px-3 py-2 text-right font-medium">Budget</th>
+                                <th class="px-3 py-2 text-right font-medium">Actual</th>
+                                <th class="px-3 py-2 text-right font-medium">Variance</th>
+                                <th class="px-3 py-2 text-right font-medium">%</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr
+                                v-for="line in displayLines"
+                                :key="line.id ?? line.category"
+                                class="border-t border-fg-pale-grey hover:bg-fg-pale-grey"
                             >
-                                {{ money(variance(line)) }}
-                            </td>
-                            <td class="px-3 py-1.5 text-right font-mono text-xs text-fg-light-grey">
-                                {{ variancePercent(line) === null ? '—' : variancePercent(line).toFixed(1) + '%' }}
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
+                                <td class="px-3 py-1.5">{{ line.category }}</td>
+                                <td class="px-3 py-1.5 text-right font-mono text-xs">{{ money(line.budget) }}</td>
+                                <td class="px-3 py-1.5 text-right font-mono text-xs">{{ money(line.actual) }}</td>
+                                <td class="px-3 py-1.5 text-right font-mono text-xs" :class="varianceClass(line)">
+                                    {{ money(variance(line)) }}
+                                </td>
+                                <td class="px-3 py-1.5 text-right font-mono text-xs text-fg-light-grey">
+                                    {{ variancePercent(line) === null ? '—' : variancePercent(line).toFixed(1) + '%' }}
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <div class="space-y-4">

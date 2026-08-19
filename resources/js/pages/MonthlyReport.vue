@@ -29,6 +29,12 @@ onMounted(async () => {
 watch(selectedFarmId, loadReport);
 watch(selectedMonth, loadCommentaryDraft);
 
+// Hand off the selected farm to the Client view tab so "view client-friendly
+// report" opens on the same farm the adviser was just looking at.
+watch(selectedFarmId, (id) => {
+    if (id) localStorage.setItem('selectedFarmId', id);
+});
+
 async function loadReport() {
     loading.value = true;
     const { data } = await axios.get(`/api/farms/${selectedFarmId.value}/report`);
@@ -139,6 +145,12 @@ Write the monthly commentary for this farm and month.`;
             <select v-model="selectedMonth" class="rounded border border-fg-muted-grey bg-white px-3 py-1.5 text-sm">
                 <option v-for="month in months" :key="month" :value="month">{{ monthName(month) }}</option>
             </select>
+            <a
+                href="#client-view"
+                class="rounded border border-fg-main-blue px-3 py-1.5 text-sm font-medium text-fg-main-blue hover:bg-fg-main-blue-9"
+            >
+                View client-friendly report →
+            </a>
         </div>
 
         <p v-if="loading" class="text-fg-light-grey">Loading…</p>

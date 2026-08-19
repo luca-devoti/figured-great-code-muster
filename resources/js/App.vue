@@ -6,6 +6,7 @@ import Inbox from './pages/Inbox.vue';
 import MonthlyReport from './pages/MonthlyReport.vue';
 import InvoiceEntry from './pages/InvoiceEntry.vue';
 import StockReconciliation from './pages/StockReconciliation.vue';
+import ClientView from './pages/ClientView.vue';
 import AiExample from './pages/AiExample.vue';
 
 // Plain tab navigation - no router needed for five pages.
@@ -16,6 +17,7 @@ const tabs = [
     { key: 'report', label: 'Monthly report', component: MonthlyReport },
     { key: 'invoices', label: 'Invoice entry', component: InvoiceEntry },
     { key: 'stock', label: 'Stock reconciliation', component: StockReconciliation },
+    { key: 'client-view', label: 'Client view', component: ClientView },
     { key: 'ai', label: 'AI example', component: AiExample },
 ];
 
@@ -26,6 +28,13 @@ function openTab(tab) {
     activeTab.value = tab;
     window.location.hash = tab.key;
 }
+
+// Also react to the hash changing from outside a nav click (e.g. a "view
+// client report" link on another page) so it doesn't need its own router.
+window.addEventListener('hashchange', () => {
+    const tab = tabs.find((t) => t.key === window.location.hash.slice(1));
+    if (tab) activeTab.value = tab;
+});
 </script>
 
 <template>

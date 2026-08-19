@@ -23,7 +23,9 @@ const generateError = ref('');
 onMounted(async () => {
     const { data } = await axios.get('/api/farms');
     farms.value = data;
-    selectedFarmId.value = data[0]?.id ?? null;
+    // Pick up whatever farm was last selected on the Client view tab, if any.
+    const stored = Number(localStorage.getItem('selectedFarmId'));
+    selectedFarmId.value = data.find((f) => f.id === stored)?.id ?? data[0]?.id ?? null;
 });
 
 watch(selectedFarmId, loadReport);

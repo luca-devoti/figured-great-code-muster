@@ -1,7 +1,11 @@
 <script setup>
 import axios from 'axios';
-import { computed, onMounted, ref, watch } from 'vue';
+import { CategoryScale, Chart, Legend, LinearScale, LineController, LineElement, PointElement, Tooltip } from 'chart.js';
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import CategorySparkline from '../components/CategorySparkline.vue';
 import { money, monthName } from '../format';
+
+Chart.register(LineController, LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Legend);
 
 const farms = ref([]);
 const selectedFarmId = ref(null);
@@ -35,6 +39,8 @@ async function onFarmChange(id) {
     lines.value = data.lines;
     weather.value = data.weather;
     loading.value = false;
+    await nextTick();
+    renderMainChart();
 }
 
 // Group the flat list of report lines by category, in first-seen order.
@@ -70,13 +76,13 @@ function isFavourable(categoryName, variance) {
 const incomeRows = computed(() =>
     [...categories.value.entries()]
         .filter(([name]) => isIncomeCategory(name))
-        .map(([name, entries]) => ({ name, ...categoryTotals(entries) })),
+        .map(([name, entries]) => ({ name, entries, ...categoryTotals(entries) })),
 );
 
 const costRows = computed(() =>
     [...categories.value.entries()]
         .filter(([name]) => !isIncomeCategory(name))
-        .map(([name, entries]) => ({ name, ...categoryTotals(entries) })),
+        .map(([name, entries]) => ({ name, entries, ...categoryTotals(entries) })),
 );
 
 const netPosition = computed(() => {
@@ -89,6 +95,121 @@ const netPosition = computed(() => {
         budgetNet: budgetIncome - budgetCost,
         actualNet: actualIncome - actualCost,
     };
+});
+
+// Month-by-month net (income minus cost), then a running year-to-date total -
+// this is what answers "am I ahead or behind, and when did that happen?".
+const monthlyNet = computed(() =>
+    months.value.map((month) => {
+        let budgetIncome = 0;
+        let actualIncome = 0;
+        let budgetCost = 0;
+        let actualCost = 0;
+        for (const line of lines.value) {
+            if (line.month !== month) continue;
+            if (isIncomeCategory(line.category)) {
+                budgetIncome += line.budget;
+                actualIncome += line.actual;
+            } else {
+                budgetCost += line.budget;
+                actualCost += line.actual;
+            }
+        }
+        return { month, budgetNet: budgetIncome - budgetCost, actualNet: actualIncome - actualCost };
+    }),
+);
+
+const cumulativeNet = computed(() => {
+    let budgetRunning = 0;
+    let actualRunning = 0;
+    return monthlyNet.value.map((m) => {
+        budgetRunning += m.budgetNet;
+        actualRunning += m.actualNet;
+        return { month: m.month, budgetCumulative: budgetRunning, actualCumulative: actualRunning };
+    });
+});
+
+const mainChartCanvas = ref(null);
+let mainChart = null;
+
+function renderMainChart() {
+    if (!mainChartCanvas.value || !cumulativeNet.value.length) return;
+
+    const labels = cumulativeNet.value.map((c) => monthName(c.month));
+    const budgetData = cumulativeNet.value.map((c) => c.budgetCumulative);
+    const actualData = cumulativeNet.value.map((c) => c.actualCumulative);
+
+    if (mainChart) {
+        mainChart.data.labels = labels;
+        mainChart.data.datasets[0].data = budgetData;
+        mainChart.data.datasets[1].data = actualData;
+        mainChart.update();
+        return;
+    }
+
+    mainChart = new Chart(mainChartCanvas.value, {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Budgeted profit (year to date)',
+                    data: budgetData,
+                    borderColor: '#90a4ae',
+                    borderDash: [5, 5],
+                    borderWidth: 2,
+                    pointRadius: 2,
+                    tension: 0.2,
+                },
+                {
+                    label: 'Actual profit (year to date)',
+                    data: actualData,
+                    borderColor: '#296fdc',
+                    borderWidth: 2.5,
+                    pointRadius: 2,
+                    tension: 0.2,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
+            plugins: {
+                legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => `${ctx.dataset.label}: ${money(ctx.parsed.y)}`,
+                    },
+                },
+            },
+            scales: {
+                y: {
+                    ticks: { callback: (value) => money(value) },
+                    grid: { color: '#eceff1' },
+                },
+                x: {
+                    grid: { display: false },
+                },
+            },
+        },
+    });
+}
+
+function destroyMainChart() {
+    mainChart?.destroy();
+    mainChart = null;
+}
+
+onBeforeUnmount(destroyMainChart);
+
+// The whole app is wrapped in <KeepAlive>, so switching away from this tab
+// hides rather than unmounts it. A hidden container measures as 0x0, and a
+// plain resize() didn't reliably pick up the restored size, so rebuild the
+// chart from scratch on reactivation instead - otherwise it comes back blank.
+onActivated(() => {
+    destroyMainChart();
+    renderMainChart();
 });
 
 // Seasonal domain knowledge, one block per farm type - only the block matching
@@ -288,6 +409,11 @@ async function generateSummary() {
             <div class="rounded border border-fg-muted-grey bg-white p-5">
                 <h3 class="mb-3 text-sm font-semibold">Your year at a glance — {{ monthName(months[0]) }} to {{ monthName(months[months.length - 1]) }}</h3>
 
+                <p class="mb-1 text-xs font-medium text-fg-light-grey">Profit so far this year, budget vs actual</p>
+                <div class="mb-4 h-64 w-full">
+                    <canvas ref="mainChartCanvas"></canvas>
+                </div>
+
                 <div class="mb-4 grid grid-cols-3 gap-3 text-center">
                     <div class="rounded bg-fg-super-pale-grey p-3">
                         <p class="text-xs text-fg-light-grey">Budgeted profit</p>
@@ -316,6 +442,7 @@ async function generateSummary() {
                     <tbody>
                         <tr v-for="row in incomeRows" :key="row.name" class="border-t border-fg-pale-grey">
                             <td class="py-1">{{ row.name }}</td>
+                            <td class="py-1"><CategorySparkline :entries="row.entries" /></td>
                             <td class="py-1 text-right font-mono text-xs text-fg-light-grey">budget {{ money(row.budget) }}</td>
                             <td class="py-1 text-right font-mono text-xs">actual {{ money(row.actual) }}</td>
                             <td
@@ -333,6 +460,7 @@ async function generateSummary() {
                     <tbody>
                         <tr v-for="row in costRows" :key="row.name" class="border-t border-fg-pale-grey">
                             <td class="py-1">{{ row.name }}</td>
+                            <td class="py-1"><CategorySparkline :entries="row.entries" /></td>
                             <td class="py-1 text-right font-mono text-xs text-fg-light-grey">budget {{ money(row.budget) }}</td>
                             <td class="py-1 text-right font-mono text-xs">actual {{ money(row.actual) }}</td>
                             <td
